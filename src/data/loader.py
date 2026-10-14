@@ -23,6 +23,15 @@ RAW_FILES = {
     "zones": ("raw_zones.csv", ["timestamp", "zone_id", "zone_P", "zone_V"]),
     "transformer": ("raw_transformer.csv", ["timestamp", "trans_P"]),
 }
+
+#: cle d'unicite de chaque fichier de mesures. Un doublon fausserait les
+#: jointures et les remises en forme (T, H) sans erreur visible : on refuse
+#: donc le fichier des le chargement.
+UNIQUE_KEYS = {
+    "houses": ["timestamp", "house_id"],
+    "zones": ["timestamp", "zone_id"],
+    "transformer": ["timestamp"],
+}
 LABEL_FILE = "labels.csv"
 
 #: colonnes de labels.csv formellement interdites comme features
@@ -50,6 +59,17 @@ class RawData:
         return self.labels[self.labels["entity_type"] == "transformer"]
 
 
+def _assert_unique(df: pd.DataFrame, keys: list[str], entity: str) -> None:
+    """Refuse tout fichier comportant des cles de telemetrie dupliquees."""
+    duplicates = int(df.duplicated(keys).sum())
+    if duplicates > 0:
+        examples = (df.loc[df.duplicated(keys, keep=False), keys]
+                    .drop_duplicates().head(3).to_dict("records"))
+        raise ValueError(
+            f"{entity} : {duplicates} enregistrement(s) duplique(s) sur la cle "
+            f"{keys}. Exemples : {examples}")
+
+
 def _read(path: Path, expected_columns: list[str] | None = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Fichier introuvable : {path}")
@@ -69,9 +89,14 @@ def _read(path: Path, expected_columns: list[str] | None = None) -> pd.DataFrame
 
 def load_raw_data(data_dir: Path) -> RawData:
     """Charge les trois fichiers de mesures + les labels, schemas verifies."""
-    frames = {name: _read(data_dir / fname, cols)
-              for name, (fname, cols) in RAW_FILES.items()}
+    frames = {}
+    for name, (fname, cols) in RAW_FILES.items():
+        frame = _read(data_dir / fname, cols)
+        _assert_unique(frame, UNIQUE_KEYS[name], fname)
+        frames[name] = frame
     labels = _read(data_dir / LABEL_FILE)
+    _assert_unique(labels, ["timestamp", "entity_type", "entity_id"],
+                   LABEL_FILE)
     return RawData(houses=frames["houses"], zones=frames["zones"],
                    transformer=frames["transformer"], labels=labels)
 

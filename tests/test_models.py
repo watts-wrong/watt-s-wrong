@@ -74,3 +74,32 @@ def test_politique_de_confiance():
     out = apply_confidence_policy(predictions, np.array([0.62, 0.95]), 0.80)
     assert out["reported_label"].tolist() == ["INCERTAIN", "overload"]
     assert out["status"].tolist() == ["INCERTAIN", "DIAGNOSTIC"]
+
+
+# ---------------------------------------------------------------------------
+# Bug 01 : le code source des modeles doit etre suivi par Git
+# ---------------------------------------------------------------------------
+
+def test_src_models_suivi_par_git():
+    """Un motif `models/` non ancre ignorerait aussi le code source."""
+    import subprocess
+    sources = ["src/models/lightgbm_model.py", "src/models/isolation_forest.py",
+               "src/models/calibration.py"]
+    for path in sources:
+        result = subprocess.run(["git", "check-ignore", path],
+                                capture_output=True, text=True)
+        assert result.returncode != 0, f"{path} est ignore par Git"
+
+    tracked = subprocess.run(["git", "ls-files", "src/models"],
+                             capture_output=True, text=True).stdout
+    for path in sources:
+        assert path in tracked, f"{path} n'est pas suivi"
+
+
+def test_artefact_de_modele_toujours_ignore():
+    """Le joblib entraine (~90 Mo) ne doit pas entrer dans l'historique."""
+    import subprocess
+    result = subprocess.run(
+        ["git", "check-ignore", "models/energymind_final_model.joblib"],
+        capture_output=True, text=True)
+    assert result.returncode == 0, "l'artefact de modele n'est plus ignore"

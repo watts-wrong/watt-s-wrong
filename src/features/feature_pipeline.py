@@ -49,8 +49,12 @@ class FittedStats:
 
     zone_resid: tuple[float, float] = (0.0, 1.0)
     trans_resid: tuple[float, float] = (0.0, 1.0)
-    zone_loss_model: tuple[float, float] = (0.0, 0.0)
-    trans_loss_model: tuple[float, float] = (0.0, 0.0)
+    # None tant que fit() n'a pas eu lieu. Surtout pas (0.0, 0.0) : c'est un
+    # resultat d'ajustement parfaitement legitime, qui serait alors confondu
+    # avec "pas encore ajuste" et declencherait un reajustement silencieux.
+    zone_loss_model: tuple[float, float] | None = None
+    trans_loss_model: tuple[float, float] | None = None
+    trans_house_loss_model: tuple[float, float] | None = None
     baseline: np.ndarray | None = None      # (creneau, week-end, maison)
     house_median_P: np.ndarray | None = None
     hour_median: np.ndarray | None = None   # (24, maison)
@@ -117,6 +121,15 @@ class FeatureBuilder:
             raw["zone_rel"][train_steps].ravel())
         self.stats.trans_loss_model = fit_loss_model(
             raw["sum_zone_P"][train_steps], raw["trans_rel"][train_steps])
+
+        # Redondance transformateur <-> somme des maisons, utilisee par les
+        # regles. Elle doit etre apprise sur le TRAIN comme les autres : la
+        # fitter sur l'historique complet ferait entrer la periode de test
+        # dans un parametre utilise a l'inference.
+        total_houses = raw["sum_house_P"].sum(axis=1)
+        trans_house_rel = self._trans_house_relative(total_houses)
+        self.stats.trans_house_loss_model = fit_loss_model(
+            total_houses[train_steps], trans_house_rel[train_steps])
         self.stats.zone_resid = robust_scale(
             self.zone_residual()[train_steps].ravel())
         self.stats.trans_resid = robust_scale(
@@ -194,14 +207,23 @@ class FeatureBuilder:
     # ------------------------------------------------------------------
     # grandeurs derivees, partagees par les modules de features
     # ------------------------------------------------------------------
+    def _trans_house_relative(self, total_houses: np.ndarray) -> np.ndarray:
+        """(T,) ecart relatif entre le compteur du poste et la somme des maisons."""
+        eps = float(self.f["eps_power_kw"])
+        return self.wide.trans_P / np.maximum(total_houses, eps) - 1.0
+
     def zone_residual(self) -> np.ndarray:
         """(T, Z) ecart entre la mesure de zone et la perte attendue."""
+        if self.stats.zone_loss_model is None:
+            raise RuntimeError("appeler fit(train_steps) avant zone_residual()")
         intercept, slope = self.stats.zone_loss_model
         return self.raw_signals["zone_rel"] - (
             intercept + slope * self.raw_signals["sum_house_P"])
 
     def trans_residual(self) -> np.ndarray:
         """(T,) ecart entre la mesure du poste et la perte attendue."""
+        if self.stats.trans_loss_model is None:
+            raise RuntimeError("appeler fit(train_steps) avant trans_residual()")
         intercept, slope = self.stats.trans_loss_model
         return self.raw_signals["trans_rel"] - (
             intercept + slope * self.raw_signals["sum_zone_P"])
@@ -253,12 +275,19 @@ class FeatureBuilder:
         eps = float(self.f["eps_power_kw"])
         zone_of_house = wide.zone_of_house
 
+        if self.stats.trans_house_loss_model is None:
+            raise RuntimeError(
+                "FeatureBuilder.fit(train_steps) doit etre appele avant "
+                "rule_signals() : sans cela le modele de perte "
+                "transformateur <-> maisons serait ajuste sur l'historique "
+                "complet, ce qui ferait fuiter la periode de test.")
+
         total_houses = raw["sum_house_P"].sum(axis=1)
         zone_rel = self.zone_residual()[:, zone_of_house]
         trans_vs_zones = np.repeat(self.trans_residual()[:, None], wide.H,
                                    axis=1)
-        trans_house_rel = wide.trans_P / np.maximum(total_houses, eps) - 1.0
-        intercept, slope = fit_loss_model(total_houses, trans_house_rel)
+        trans_house_rel = self._trans_house_relative(total_houses)
+        intercept, slope = self.stats.trans_house_loss_model
         trans_vs_houses = np.repeat(
             (trans_house_rel - (intercept + slope * total_houses))[:, None],
             wide.H, axis=1)

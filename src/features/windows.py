@@ -49,11 +49,19 @@ def rolling_slope(values: np.ndarray, window: int,
     centred = x - x.mean()
     kernel = centred / (centred ** 2).sum()
 
-    # les trous sont propages vers l'avant pour ne pas annuler la fenetre ;
-    # le noyau est de somme nulle, un decalage constant n'a donc aucun effet
-    filled = pd.DataFrame(values).ffill().to_numpy()
+    # Les trous sont propages vers l'avant pour que la convolution reste
+    # definie ; le noyau est de somme nulle, un decalage constant n'a donc
+    # aucun effet sur la pente.
+    #
+    # ATTENTION : la validite se compte sur les valeurs BRUTES, jamais sur les
+    # valeurs remplies. Pendant une coupure de capteur, le report avant cree
+    # des valeurs constantes qui produiraient une pente nulle credible alors
+    # qu'aucune mesure n'a ete recue. On exige donc min_periods observations
+    # REELLES dans la fenetre.
+    raw = np.asarray(values, dtype=float)
+    filled = pd.DataFrame(raw).ffill().to_numpy()
     out = np.full_like(filled, np.nan, dtype=float)
-    valid = (~np.isnan(filled)).astype(float)
+    valid = (~np.isnan(raw)).astype(float)
     counts = pd.DataFrame(valid).rolling(window, min_periods=1).sum().to_numpy()
     filled = np.nan_to_num(filled, nan=0.0)
     for column in range(filled.shape[1]):
@@ -105,13 +113,44 @@ def fit_loss_model(load: np.ndarray, relative: np.ndarray) -> tuple[float, float
     constante exploserait en pointe et ferait passer toute surcharge pour une
     incoherence de comptage. L'ajustement se fait sur le coeur de la
     distribution (deciles 10-90) pour ne pas etre tire par les anomalies.
+
+    Robustesse : longueurs incompatibles rejetees, valeurs non finies
+    ecartees, et repli sur une pente nulle quand la regression n'a pas de
+    sens — moins de deux points exploitables, ou charge quasi constante
+    (``np.polyfit`` y est numeriquement instable et emet un RankWarning).
     """
-    usable = np.isfinite(load) & np.isfinite(relative)
-    if usable.sum() < 100:
-        return (float(np.nanmedian(relative)) if usable.any() else 0.0), 0.0
-    low, high = np.nanquantile(relative[usable], [0.10, 0.90])
-    core = usable & (relative >= low) & (relative <= high)
+    load_array = np.asarray(load, dtype=float).ravel()
+    relative_array = np.asarray(relative, dtype=float).ravel()
+    if load_array.size != relative_array.size:
+        raise ValueError(
+            f"fit_loss_model : longueurs incompatibles "
+            f"({load_array.size} charges, {relative_array.size} residus)")
+
+    usable = np.isfinite(load_array) & np.isfinite(relative_array)
+    if usable.sum() < 2:
+        return _fallback_intercept(relative_array[usable]), 0.0
+
+    low, high = np.nanquantile(relative_array[usable], [0.10, 0.90])
+    core = usable & (relative_array >= low) & (relative_array <= high)
     if core.sum() < 50:
         core = usable
-    slope, intercept = np.polyfit(load[core], relative[core], 1)
+
+    # une charge constante ne porte aucune information de pente
+    if core.sum() < 2 or float(np.ptp(load_array[core])) < 1e-6:
+        return _fallback_intercept(relative_array[core]), 0.0
+
+    try:
+        slope, intercept = np.polyfit(load_array[core], relative_array[core], 1)
+    except (np.linalg.LinAlgError, ValueError):
+        return _fallback_intercept(relative_array[core]), 0.0
+    if not (np.isfinite(slope) and np.isfinite(intercept)):
+        return _fallback_intercept(relative_array[core]), 0.0
     return float(intercept), float(slope)
+
+
+def _fallback_intercept(values: np.ndarray) -> float:
+    """Repli : residu median, ou zero si rien d'exploitable."""
+    if values.size == 0:
+        return 0.0
+    median = float(np.median(values))
+    return median if np.isfinite(median) else 0.0
